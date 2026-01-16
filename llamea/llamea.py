@@ -10,11 +10,20 @@ import os
 import random
 import re
 import traceback
+import warnings
 from typing import Callable, Optional
+import pickle
+import jsonlines
 
 import numpy as np
-from ConfigSpace import ConfigurationSpace
 from joblib import Parallel, delayed
+
+from .llm import LLM
+
+try:
+    from ConfigSpace import ConfigurationSpace
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    ConfigurationSpace = None
 
 from .loggers import ExperimentLogger
 from .solution import Solution
@@ -25,8 +34,6 @@ from .utils import (
     handle_timeout,
 )
 
-# TODOs:
-# Implement diversity selection mechanisms (none, prefer short code, update population only when (distribution of) results is different, AST / code difference)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,8 +77,14 @@ class LLaMEA:
         niche_radius: Optional[float] = None,
         adaptive_niche_radius: bool = False,
         clearing_interval: Optional[int] = None,
+        behavior_descriptor: Optional[Callable[[Solution], tuple]] = None,
+        map_elites_bins: Optional[tuple[int, ...] | int] = None,
+        novelty_k: int = 5,
+        novelty_archive_size: Optional[int] = 100,
         evaluate_population=False,
         diff_mode: bool = False,
+        parent_selection: str = "random",
+        tournament_size: int = 3,
     ):
         """
         Initializes the LLaMEA instance with provided parameters. Note that by default LLaMEA maximizes the objective.
@@ -101,8 +114,8 @@ class LLaMEA:
             log (bool): Flag to switch of the logging of experiments.
             minimization (bool): Whether we minimize or maximize the objective function. Defaults to False.
             _random (bool): Flag to switch to random search (purely for debugging).
-            niching (str | None): Niching strategy to use. Supports "sharing" and
-                "clearing". If ``None``, niching is disabled.
+            niching (str | None): Niching strategy to use. Supports "sharing",
+                "clearing", and "map_elites". If ``None``, niching is disabled.
             distance_metric (callable | None): Function that computes a distance
                 between two :class:`Solution` objects. Defaults to a simple AST
                 based distance if not supplied.
@@ -113,19 +126,46 @@ class LLaMEA:
                 the population each generation.
             clearing_interval (int | None): Interval (in generations) at which
                 clearing is applied when ``niching`` is set to ``"clearing"``.
+            behavior_descriptor (callable | None): Function returning a tuple
+                that characterizes a :class:`Solution` for MAP-Elites. If not
+                provided the descriptor is derived from basic code statistics.
+            map_elites_bins (tuple[int, ...] | int | None): Number of bins per
+                dimension for the MAP-Elites archive. If ``None`` a default of
+                ten bins per descriptor dimension is used.
+            novelty_k (int): Number of nearest neighbours considered when
+                computing novelty scores if ``niching`` is set to
+                ``"novelty"``.
+            novelty_archive_size (int | None): Maximum size of the novelty
+                archive when ``niching`` is set to ``"novelty"``. ``None``
+                keeps all past individuals.
             evaluate_population (bool): If True, the evaluation function `f` should
-                accept and return a list of solutions representing a full population
-                instead of a single solution.
+                accept a list with the new population and a list of parents (optionally, to deal with elitism)
+                and return a list of solutions that are evaluated, also the parents may receive new fitness values and should be returned.
+                So `f` should have the signature
+                `f(population, parents=None, logger=None) -> (evaluated_offspring, evaluated_parents)`.
             diff_mode (bool): If ``True``, the LLM is asked to generate unified diff
                 patches instead of complete code when evolving solutions.
+            parent_selection (str): Strategy for selecting parents to produce
+                offspring. Options are ``"random"``, ``"tournament"``, which
+                picks the best from a sampled subset, and fitness-proportionate
+                roulette wheel selection ``"roulette"``.
+            tournament_size (int): Number of candidates sampled in each
+                tournament when using ``"tournament"`` selection.
         """
         self.llm = llm
         self.model = llm.model
         self.diff_mode = diff_mode
+
         self.eval_timeout = eval_timeout
         self.f = f  # evaluation function, provides an individual as output.
         self.role_prompt = role_prompt
         self.parallel_backend = parallel_backend
+        if HPO and ConfigurationSpace is None:
+            warnings.warn(
+                "ConfigSpace is not installed. Install ConfigSpace to enable HPO.",
+                stacklevel=2,
+            )
+            HPO = False
         if role_prompt == "":
             self.role_prompt = "You are a highly skilled computer scientist in the field of natural computing. Your task is to design novel metaheuristic algorithms to solve black box optimization problems."
         if task_prompt == "":
@@ -154,12 +194,12 @@ class RandomSearch:
     def __call__(self, func):
         for i in range(self.budget):
             x = np.random.uniform(func.bounds.lb, func.bounds.ub)
-            
+
             f = func(x)
             if f < self.f_opt:
                 self.f_opt = f
                 self.x_opt = x
-            
+
         return self.f_opt, self.x_opt
 ```
 """
@@ -187,15 +227,30 @@ Space: <configuration_space>"""
         else:
             self.output_format_prompt = output_format_prompt
         self.diff_output_format_prompt = """
-Provide only the unified diff patch for the requested changes. Begin with
-`--- original.py` and `+++ updated.py` headers and enclose the patch in a
-markdown code block labelled as diff:
-# Description: <short-description>
-```diff
---- original.py
-+++ updated.py
-@@
-<patch>
+        ---
+You MUST use the exact SEARCH/REPLACE diff format shown below to indicate changes:
+```
+<<<<<<< SEARCH
+# Original code to find and replace (must match exactly)
+=======
+# New replacement code
+>>>>>>> REPLACE
+```
+
+Example of valid diff format:
+```
+<<<<<<< SEARCH
+for i in range(m):
+    for j in range(p):
+        for k in range(n):
+            C[i, j] += A[i, k] * B[k, j]
+=======
+# Reorder loops for better memory access pattern
+for i in range(m):
+    for k in range(n):
+        for j in range(p):
+            C[i, j] += A[i, k] * B[k, j]
+>>>>>>> REPLACE
 ```
 """
         self.mutation_prompts = mutation_prompts
@@ -221,14 +276,29 @@ markdown code block labelled as diff:
         self.worst_value = -np.inf
         if minimization:
             self.worst_value = np.inf
+        if niching == "novelty" and self.minimization:
+            raise ValueError("Novelty niching only supports maximization.")
         self.niching = niching
         self.distance_metric = distance_metric or code_distance
         self.niche_radius = niche_radius if niche_radius is not None else 0.5
         self.adaptive_niche_radius = adaptive_niche_radius
         self.clearing_interval = clearing_interval
+        self.behavior_descriptor = behavior_descriptor
+        self.map_elites_bins = map_elites_bins
+        self.map_elites_archive = {}
+        self.map_elites_bounds = None
+        self.map_elites_descriptor_cache = {}
+        self.map_elites_solutions = {}
+        self.novelty_k = max(1, int(novelty_k))
+        self.novelty_archive_size = (
+            None if novelty_archive_size is None else max(1, int(novelty_archive_size))
+        )
+        self.novelty_archive: list[Solution] = []
         self.best_so_far = Solution(name="", code="")
-        self.best_so_far.set_scores(self.worst_value, "", "")
+        self.best_so_far.set_scores(self.worst_value, "")
         self.experiment_name = experiment_name
+        self.parent_selection = parent_selection  # "random" | "roulette" | "tournament"
+        self.tournament_size = tournament_size
 
         if self.log:
             modelname = self.model.replace(":", "_")
@@ -236,13 +306,37 @@ markdown code block labelled as diff:
             self.llm.set_logger(self.logger)
         else:
             self.logger = None
-        self.textlog = logging.getLogger(__name__)
         if max_workers > self.n_offspring:
             max_workers = self.n_offspring
         self.max_workers = max_workers
+        self.pickle_archive()
+
+    @classmethod
+    def warm_start(cls, path_to_archive_dir):
+        """
+        Class method for warm starts, takes a archive directory, and finds pickle archieve stored at path_to_archieve_dir/llamea_config.pkl,
+        generates the object from it, and return it for warm start.
+        Args:
+            path_to_archive_dir: Directory of instance for which warm start needs to be executed.
+        """
+        try:
+            with open(f"{path_to_archive_dir}/llamea_config.pkl", "rb") as file:
+                obj = pickle.load(file)
+            return obj
+        except Exception as e:
+            print(
+                f"Error unarchiving object from {path_to_archive_dir}/llamea_config.pkl: {e.__repr__()}"
+            )
+            return None
+
+    def __getstate__(self):
+        return self.__dict__
+
+    def __setstate__(self, to_state):
+        self.__dict__.update(to_state)
 
     def logevent(self, event):
-        self.textlog.info(event)
+        print(event)
 
     def initialize_single(self):
         """
@@ -265,15 +359,11 @@ markdown code block labelled as diff:
             if not self.evaluate_population:
                 new_individual = self.evaluate_fitness(new_individual)
         except Exception as e:
-            new_individual.set_scores(
-                self.worst_value,
-                f"An exception occured: {traceback.format_exc()}.",
-                repr(e) + traceback.format_exc(),
-            )
+            new_individual.set_scores(self.worst_value, "", e)
             self.logevent(f"An exception occured: {traceback.format_exc()}.")
             if hasattr(self.f, "log_individual"):
                 self.f.log_individual(new_individual)
-
+        print("Releasing individual", new_individual)
         return new_individual
 
     def initialize(self):
@@ -281,7 +371,7 @@ markdown code block labelled as diff:
         Initializes the evolutionary process by generating the first parent population.
         """
 
-        population = []
+        population = self.population
         population_gen = []
         try:
             timeout = self.eval_timeout
@@ -290,10 +380,12 @@ markdown code block labelled as diff:
                 backend=self.parallel_backend,
                 timeout=timeout + 15,
                 return_as="generator_unordered",
-            )(delayed(self.initialize_single)() for _ in range(self.n_parents))
+            )(
+                delayed(self.initialize_single)()
+                for _ in range(self.n_parents - len(population))
+            )
         except Exception as e:
             print(f"Parallel time out in initialization {e}, retrying.")
-
         for p in population_gen:
             population.append(p)
 
@@ -302,6 +394,9 @@ markdown code block labelled as diff:
 
         for p in population:
             self.run_history.append(p)
+
+        if self.niching == "novelty":
+            population = self.apply_niching(population)
 
         self.generation += 1
         self.population = population  # Save the entire population
@@ -323,30 +418,45 @@ markdown code block labelled as diff:
 
         return updated_individual
 
-    def evaluate_population_fitness(self, population):
+    def evaluate_population_fitness(self, new_population):
         """Evaluate a full population of solutions."""
         with contextlib.redirect_stdout(None):
-            evaluated = self.f(population, self.logger)
-        return evaluated
+            # pass the new population and the parent population to the evaluation function
+            evaluated_offspring, evaluated_parents = self.f(
+                new_population, self.population, self.logger
+            )
+            self.population = evaluated_parents  # The parent population fitness might also be updated (this does not need to be logged)
+        return evaluated_offspring
 
     def optimize_task_prompt(self, individual):
         """Use the LLM to improve the task prompt for a given individual."""
+
+        error_message = ""
+        if individual.error:
+            error_message = f"""
+### Error Encountered
+{individual.error}
+
+"""
+
         prompt = f"""{self.role_prompt}
-You are tasked with refining the instruction that guides algorithm generation.
+You are tasked with refining the instructions (task prompt) that guides an LLM to generate algorithms.
 ### Current task prompt:
 ----
 {individual.task_prompt}
 ----
 
-### The current algorithm generated:
-----
+### The current algorithm generated with that prompt:
+```python
 {individual.code}
-----
+```
 
- Feedback from the evaluation on this algorithm:
+### Feedback from the evaluation on this algorithm:
 ----
 {individual.feedback}
 ----
+
+{error_message}
 
 Provide an improved / rephrased / augmented task prompt only. The intent of the task prompt should stay the same.
 """
@@ -358,7 +468,7 @@ Provide an improved / rephrased / augmented task prompt only. The intent of the 
             self.logevent(f"Prompt optimization failed: {e}")
             return individual.task_prompt
 
-    def construct_prompt(self, individual):
+    def construct_prompt(self, individual: Solution):
         """
         Constructs a new session prompt for the language model based on a selected individual.
 
@@ -373,12 +483,19 @@ Provide an improved / rephrased / augmented task prompt only. The intent of the 
         solution = individual.code
         description = individual.description
         feedback = individual.feedback
+        error_message = ""
+        if individual.error:
+            error_message = f"""
+### Error Encountered
+{individual.error}
+
+"""
         if self.adaptive_mutation == True:
             num_lines = len(solution.split("\n"))
             prob = discrete_power_law_distribution(num_lines, 1.5)
-            new_mutation_prompt = f"""Refine the strategy of the selected solution to improve it. 
-Make sure you only change {(prob*100):.1f}% of the code, which means if the code has 100 lines, you can only change {prob*100} lines, and the rest of the lines should remain unchanged. 
-This input code has {num_lines} lines, so you can only change {max(1, int(prob*num_lines))} lines, the rest {num_lines-max(1, int(prob*num_lines))} lines should remain unchanged. 
+            new_mutation_prompt = f"""Refine the strategy of the selected solution to improve it.
+Make sure you only change {(prob*100):.1f}% of the code, which means if the code has 100 lines, you can only change {prob*100} lines, and the rest of the lines should remain unchanged.
+This input code has {num_lines} lines, so you can only change {max(1, int(prob*num_lines))} lines, the rest {num_lines-max(1, int(prob*num_lines))} lines should remain unchanged.
 This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot change more or less than this rate.
 """
             self.mutation_prompts = [new_mutation_prompt]
@@ -397,13 +514,23 @@ The selected solution to update is:
 {description}
 
 With code:
+
+```python
 {solution}
+```
+
+
+Feedback:
 
 {feedback}
 
+{error_message}
+
 {mutation_operator}
+
 {self.diff_output_format_prompt if self.diff_mode else self.output_format_prompt}
 """
+
         session_messages = [
             {"role": "user", "content": self.role_prompt + final_prompt},
         ]
@@ -419,7 +546,7 @@ With code:
         """
         Update the best individual in the new population
         """
-        if self.minimization == False:
+        if self.niching == "novelty" or self.minimization == False:
             best_individual = max(self.population, key=lambda x: x.fitness)
 
             if best_individual.fitness > self.best_so_far.fitness:
@@ -441,8 +568,189 @@ With code:
         if dists:
             self.niche_radius = float(np.mean(dists))
 
+    def _ensure_map_elites_bins(self, descriptor: tuple[float, ...]):
+        """Ensure the MAP-Elites bin configuration matches the descriptor."""
+
+        if self.map_elites_bins is None:
+            self.map_elites_bins = tuple(10 for _ in descriptor)
+        elif isinstance(self.map_elites_bins, int):
+            self.map_elites_bins = tuple(self.map_elites_bins for _ in descriptor)
+        elif len(self.map_elites_bins) != len(descriptor):
+            if len(self.map_elites_bins) == 1:
+                self.map_elites_bins = tuple(
+                    self.map_elites_bins[0] for _ in descriptor
+                )
+            else:
+                raise ValueError(
+                    "MAP-Elites bin configuration must match descriptor dimensionality."
+                )
+
+    def _update_map_bounds(self, descriptor: tuple[float, ...]) -> bool:
+        """Update descriptor bounds and indicate if the archive needs rebuilding."""
+
+        if self.map_elites_bounds is None:
+            self.map_elites_bounds = [(value, value) for value in descriptor]
+            return False
+
+        changed = False
+        bounds = list(self.map_elites_bounds)
+        for i, value in enumerate(descriptor):
+            min_val, max_val = bounds[i]
+            if value < min_val:
+                min_val = value
+                changed = True
+            if value > max_val:
+                max_val = value
+                changed = True
+            bounds[i] = (min_val, max_val)
+        self.map_elites_bounds = bounds
+        return changed
+
+    def _descriptor_to_cell(self, descriptor: tuple[float, ...]) -> tuple[int, ...]:
+        """Convert a descriptor into a MAP-Elites grid cell index."""
+
+        if self.map_elites_bounds is None:
+            self.map_elites_bounds = [(value, value) for value in descriptor]
+
+        coords: list[int] = []
+        for i, value in enumerate(descriptor):
+            min_val, max_val = self.map_elites_bounds[i]
+            bins = self.map_elites_bins[i]
+            if max_val - min_val <= 1e-12 or bins <= 1:
+                coords.append(0)
+                continue
+            ratio = (value - min_val) / (max_val - min_val)
+            ratio = max(0.0, min(1.0, ratio))
+            index = int(round(ratio * (bins - 1)))
+            index = min(bins - 1, max(0, index))
+            coords.append(index)
+        return tuple(coords)
+
+    def _rebuild_map_archive(self):
+        """Recompute archive cell assignments after bounds change."""
+
+        new_archive: dict[tuple[int, ...], Solution] = {}
+        for sol_id, descriptor in self.map_elites_descriptor_cache.items():
+            solution = self.map_elites_solutions.get(sol_id)
+            if solution is None:
+                continue
+            cell = self._descriptor_to_cell(descriptor)
+            incumbent = new_archive.get(cell)
+            if incumbent is None or self._is_better(solution, incumbent):
+                new_archive[cell] = solution
+        self.map_elites_archive = new_archive
+
+    def get_behavior_descriptor(self, solution: Solution) -> tuple[float, ...]:
+        """Return the behavior descriptor used for MAP-Elites."""
+
+        descriptor = None
+        if self.behavior_descriptor is not None:
+            descriptor = self.behavior_descriptor(solution)
+        elif solution.get_metadata("behavior_descriptor") is not None:
+            descriptor = solution.get_metadata("behavior_descriptor")
+
+        if descriptor is None:
+            code = solution.code or ""
+            lines = len(code.splitlines())
+            tokens = re.findall(r"\w+", code)
+            descriptor = (float(lines), float(len(set(tokens))))
+
+        descriptor_tuple = tuple(float(x) for x in descriptor)
+        if not descriptor_tuple:
+            descriptor_tuple = (0.0,)
+        return descriptor_tuple
+
+    def _apply_map_elites(self, population):
+        """Update the MAP-Elites archive with ``population`` and return elites."""
+
+        elites: list[Solution] = []
+        for individual in population:
+            descriptor = self.get_behavior_descriptor(individual)
+            self._ensure_map_elites_bins(descriptor)
+            bounds_changed = self._update_map_bounds(descriptor)
+            if bounds_changed:
+                self._rebuild_map_archive()
+            cell = self._descriptor_to_cell(descriptor)
+            self.map_elites_descriptor_cache[individual.id] = descriptor
+            self.map_elites_solutions[individual.id] = individual
+            incumbent = self.map_elites_archive.get(cell)
+            if incumbent is None or self._is_better(individual, incumbent):
+                self.map_elites_archive[cell] = individual
+
+        elites = list(self.map_elites_archive.values())
+        return elites if elites else population
+
+    def _is_better(self, candidate: Solution, incumbent: Solution) -> bool:
+        """Return ``True`` if ``candidate`` dominates ``incumbent``."""
+
+        if self.minimization:
+            return candidate.fitness < incumbent.fitness
+        return candidate.fitness > incumbent.fitness
+
+    def _update_novelty_archive(self, candidates: list[Solution]):
+        """Update the novelty archive with ``candidates``."""
+
+        if not candidates:
+            return
+
+        unique: dict[str, Solution] = {ind.id: ind for ind in self.novelty_archive}
+        for individual in candidates:
+            unique[individual.id] = individual
+
+        archive = list(unique.values())
+        archive.sort(
+            key=lambda x: x.get_metadata("novelty_score")
+            if x.get_metadata("novelty_score") is not None
+            else -np.inf,
+            reverse=True,
+        )
+
+        if (
+            self.novelty_archive_size is not None
+            and len(archive) > self.novelty_archive_size
+        ):
+            archive = archive[: self.novelty_archive_size]
+        self.novelty_archive = archive
+
+    def _apply_novelty(self, population: list[Solution]):
+        """Compute novelty scores for ``population`` and update the archive."""
+
+        if not population:
+            return population
+
+        reference = list(population)
+        reference.extend(self.novelty_archive)
+
+        for individual in population:
+            distances = [
+                self.distance_metric(individual, other)
+                for other in reference
+                if other.id != individual.id
+            ]
+
+            if not distances:
+                novelty_score = 0.0
+            else:
+                distances.sort()
+                k = min(self.novelty_k, len(distances))
+                novelty_score = float(np.mean(distances[:k]))
+
+            if individual.get_metadata("raw_fitness") is None:
+                individual.add_metadata("raw_fitness", individual.fitness)
+            individual.add_metadata("novelty_score", novelty_score)
+            individual.fitness = novelty_score
+
+        self._update_novelty_archive(population)
+        return population
+
     def apply_niching(self, population):
         """Apply the configured niching strategy to ``population``."""
+        if self.niching == "map_elites":
+            return self._apply_map_elites(population)
+
+        if self.niching == "novelty":
+            return self._apply_novelty(population)
+
         if self.niching not in {"sharing", "clearing"}:
             return population
 
@@ -489,8 +797,20 @@ With code:
             list: List of new selected population.
         """
         reverse = self.minimization == False
-        # TODO filter out non-diverse solutions
-        if self.elitism:
+        if self.niching == "novelty":
+            reverse = True
+        if self.niching == "map_elites":
+            pool = parents + offspring if self.elitism else list(offspring)
+            elites = self.apply_niching(pool)
+            if len(elites) < self.n_parents:
+                remaining = [ind for ind in pool if ind not in elites]
+                remaining.sort(key=lambda x: x.fitness, reverse=reverse)
+                elites = elites + remaining[: self.n_parents - len(elites)]
+            if len(elites) <= self.n_parents:
+                new_population = elites
+            else:
+                new_population = random.sample(elites, self.n_parents)
+        elif self.elitism:
             combined_population = parents + offspring
             combined_population = self.apply_niching(combined_population)
             combined_population.sort(key=lambda x: x.fitness, reverse=reverse)
@@ -507,15 +827,13 @@ With code:
         Evolves a single solution by constructing a new prompt,
         querying the LLM, and evaluating the fitness.
         """
-        evolved_individual = individual.empty_copy()
+        individual_copy = individual.copy()
         if self.adaptive_prompt:
-            evolved_individual.task_prompt = self.optimize_task_prompt(
-                evolved_individual
-            )
-        new_prompt = self.construct_prompt(evolved_individual)
+            individual_copy.task_prompt = self.optimize_task_prompt(individual_copy)
+        new_prompt = self.construct_prompt(individual_copy)
 
+        evolved_individual = individual.empty_copy()
         try:
-            task_prompt = evolved_individual.task_prompt
             evolved_individual = self.llm.sample_solution(
                 new_prompt,
                 evolved_individual.parent_ids,
@@ -524,13 +842,13 @@ With code:
                 diff_mode=self.diff_mode,
             )
             evolved_individual.generation = self.generation
-            evolved_individual.task_prompt = task_prompt
+            evolved_individual.task_prompt = individual_copy.task_prompt
             if not self.evaluate_population:
                 evolved_individual = self.evaluate_fitness(evolved_individual)
         except Exception as e:
-            error = repr(e)
+            evolved_individual.generation = self.generation
             evolved_individual.set_scores(
-                self.worst_value, f"An exception occurred: {error}.", error
+                self.worst_value, f"An exception occurred: {e.__repr__()}.", e
             )
             if hasattr(self.f, "log_individual"):
                 self.f.log_individual(evolved_individual)
@@ -539,19 +857,143 @@ With code:
         # self.progress_bar.update(1)
         return evolved_individual
 
-    def run(self):
+    def get_population_from(self, archive_path):
+        """
+        Finds population log in archive_path/log.jsonl and loads it to current population.
+        If population size in log file is insufficient, runs initialize() for rest of the population.
+        Used to run a cold started algorithm with best known population.
+        `Note`: Make sure the goal of initialisation of current instance of LLaMEA matches the population being selected.
+        Args:
+            archive_path: A directory from previous runs, to load well known population from.
+        """
+
+        data = []
+        try:
+            with jsonlines.open(f"{archive_path}/log.jsonl") as reader:
+                for obj in reader:
+                    data.append(obj)
+
+        except Exception as e:
+            print("Error reading population: " + e.__repr__())
+
+        restore_population = data[-1 * self.n_parents :]
+        population = []
+        print(
+            f"Restoring population of size {len(restore_population)}, of {self.n_parents}"
+        )
+        for individual in restore_population:
+            print("\tRestoring...")
+            for key, value in individual.items():
+                print(f"{key}: {value}, ({type(value)})")
+            soln = Solution(
+                code=individual["code"],
+                name=individual["name"],
+                description=individual["description"],
+                configspace=(
+                    None
+                    if individual["configspace"] == ""
+                    else individual["configspace"]
+                ),
+                operator=individual["operator"],
+                task_prompt=individual["task_prompt"],
+            )
+            population.append(soln)
+
+        self.population = population
+        if len(population) < self.n_parents:
+            print(len(population), self.n_parents)
+            self.initialize()
+        else:
+            print("-----------Init not called--------------")
+
+    def _select_parents(self):
+        """
+        Return list of parents (length = n_offspring) chosen according to
+        self.parent_selection.
+        """
+        method = (self.parent_selection or "random").lower()
+        if method == "random":
+            return np.random.choice(self.population, self.n_offspring, replace=True)
+        elif method == "roulette":
+            return self._roulette_wheel_selection(self.n_offspring)
+        elif method == "tournament":
+            return self._tournament_selection(self.n_offspring, self.tournament_size)
+        else:
+            raise ValueError(f"Unknown parent_selection: {self.parent_selection}")
+
+    def _sorted_indices_by_fitness(self):
+        """Return indices of population sorted by fitness (best first for maximizing)."""
+        reverse = self.minimization == False  # maximize -> reverse True
+        return sorted(
+            range(len(self.population)),
+            key=lambda i: self.population[i].fitness,
+            reverse=reverse,
+        )
+
+    def _roulette_wheel_selection(self, k: int):
+        """
+        Rank-based roulette:
+        - Convert ordering into weights (best gets largest weight).
+        - Works robustly if raw fitness values are negative/inf.
+        """
+        n = len(self.population)
+        if n == 0:
+            return []
+        sorted_idx = self._sorted_indices_by_fitness()
+        # Assign rank weights: best -> n, worst -> 1
+        weights = np.zeros(n, dtype=float)
+        for pos, idx in enumerate(sorted_idx):
+            weights[idx] = n - pos
+        s = weights.sum()
+        if s <= 0 or not np.isfinite(s):
+            probs = np.ones(n) / n
+        else:
+            probs = weights / s
+        chosen_indices = np.random.choice(range(n), size=k, replace=True, p=probs)
+        return [self.population[i] for i in chosen_indices]
+
+    def _tournament_selection(self, k: int, tournament_size: int = 3):
+        """
+        For each parent to choose, sample `tournament_size` candidates randomly
+        and pick the best among them.
+        """
+        n = len(self.population)
+        if n == 0:
+            return []
+        ts = max(1, min(tournament_size, n))
+        selected = []
+        for _ in range(k):
+            if n >= ts:
+                cand_idx = random.sample(range(n), ts)
+            else:
+                cand_idx = list(np.random.choice(range(n), size=ts, replace=True))
+            if self.minimization:
+                best_i = min(cand_idx, key=lambda i: self.population[i].fitness)
+            else:
+                best_i = max(cand_idx, key=lambda i: self.population[i].fitness)
+            selected.append(self.population[best_i])
+        return selected
+
+    def run(self, archive_path=None):
         """
         Main loop to evolve the solutions until the evolutionary budget is exhausted.
         The method iteratively refines solutions through interaction with the language model,
         evaluates their fitness, and updates the best solution found.
 
+        Args:
+            archive_path: Runs the algorithm with a given known population, and performs
         Returns:
             tuple: A tuple containing the best solution and its fitness at the end of the evolutionary process.
         """
-        # self.progress_bar = tqdm(total=self.budget)
-        self.logevent("Initializing first population")
-        self.initialize()  # Initialize a population
-        # self.progress_bar.update(self.n_parents)
+        if archive_path != None:
+            self.logevent(f"Loading population from {archive_path}/log.jsonl...")
+            self.get_population_from(archive_path)
+        else:
+            self.logevent("No archive path provided, standard initialisation.")
+            # self.progress_bar = tqdm(total=self.budget)
+            self.logevent("Initializing first population")
+            self.initialize()  # Initialize a population
+            # self.progress_bar.update(self.n_parents)
 
         if self.log:
             self.logger.log_population(self.population)
@@ -561,9 +1003,7 @@ With code:
         )
         while len(self.run_history) < self.budget:
             # pick a new offspring population using random sampling
-            new_offspring_population = np.random.choice(
-                self.population, self.n_offspring, replace=True
-            )
+            new_offspring_population = self._select_parents()
 
             new_population = []
             try:
@@ -601,4 +1041,44 @@ With code:
                 f"Generation {self.generation}, best so far: {self.best_so_far.fitness}"
             )
 
+            ## Archive progress.
+            self.pickle_archive()
+
         return self.best_so_far
+
+    def _find_unpicklable(self, obj, path="root"):
+        try:
+            pickle.dumps(obj)
+            return None  # This object is fine
+        except Exception:
+            pass
+
+            # Inspect containers
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    bad = self._find_unpicklable(v, f"{path}[{k!r}]")
+                    if bad:
+                        return bad
+            elif isinstance(obj, (list, tuple, set)):
+                for i, v in enumerate(obj):
+                    bad = self._find_unpicklable(v, f"{path}[{i}]")
+                    if bad:
+                        return bad
+            else:
+                # It's a leaf object that failed
+                return path
+        return None
+
+    def pickle_archive(self):
+        """
+        Store the llmea object, into a file, using pickle, to support warm start.
+        """
+        try:
+            if self.logger:
+                with open(f"{self.logger.dirname}/llamea_config.pkl", "wb") as file:
+                    pickle.dump(self, file)
+        except Exception as e:
+            print(f"\tPickle error type: {type(e).__name__}, finding reason....")
+            bad_path = self._find_unpicklable(self, "llamea")
+            if bad_path:
+                print(f"\t❗ First unpicklable element at: {bad_path}.")

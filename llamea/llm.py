@@ -1,20 +1,37 @@
 """
 LLM modules to connect to different LLM providers. Also extracts code, name and description.
 """
+
 import copy
 import logging
 import pickle
+import random
 import re
 import time
 from abc import ABC, abstractmethod
 
-import google.generativeai as genai
-import ollama
-import openai
-from ConfigSpace import ConfigurationSpace
+try:
+    import google.generativeai as genai
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    genai = None
+
+try:
+    import ollama
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    ollama = None
+
+try:
+    import openai
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    openai = None
+
+try:
+    from ConfigSpace import ConfigurationSpace
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    ConfigurationSpace = None
 
 from .solution import Solution
-from .utils import NoCodeException, apply_unified_diff
+from .utils import NoCodeException, apply_code_delta
 
 
 class LLM(ABC):
@@ -130,21 +147,31 @@ class LLM(ABC):
             self.logger.log_conversation(self.model, message)
 
         code_block = self.extract_algorithm_code(message)
+        code = ""
+        success = False  # <- Flag to Implement fall back to code block update, when LLM fails to adhere to diff mode.
         if diff_mode:
             if base_code is None:
                 base_code = ""
-            code = apply_unified_diff(base_code, code_block)
+            else:
+                code, success, similarity = apply_code_delta(code_block, base_code)
+                print(
+                    f"\t Diff application {'un' if not success else ''}successful, Similarity {similarity * 100:.2f}%."
+                )
         else:
             code = code_block
 
+        if diff_mode and not success:
+            print("\t\t Falling back to code replace.")
+            code = code_block
+
         name = re.findall(
-            "class\\s*(\\w*)(?:\\(\\w*\\))?\\:",
+            r"(?:def|class)\s*(\w*).*\:",
             code,
             re.IGNORECASE,
         )[0]
         desc = self.extract_algorithm_description(message)
         cs = None
-        if HPO:
+        if HPO and ConfigurationSpace is not None:
             cs = self.extract_configspace(message)
         new_individual = Solution(
             name=name,
@@ -166,12 +193,15 @@ class LLM(ABC):
         Returns:
             ConfigSpace: Extracted configuration space object.
         """
+        if ConfigurationSpace is None:  # pragma: no cover - optional dependency
+            return None
         pattern = r"space\s*:\s*\n*```\n*(?:python)?\n(.*?)\n```"
         c = None
         for m in re.finditer(pattern, message, re.DOTALL | re.IGNORECASE):
             try:
                 c = ConfigurationSpace(eval(m.group(1)))
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - best effort
+                logging.info(e)
                 pass
         return c
 
@@ -190,7 +220,15 @@ class LLM(ABC):
         """
         match = re.search(self.code_pattern, message, re.DOTALL | re.IGNORECASE)
         if match:
-            return match.group(1)
+            code = match.group(1)
+            main_guard_pattern = re.compile(
+                r"^\s*if __name__\s*={1,2}\s*['\"]__main__['\"]\s*:\s*$",
+                re.MULTILINE,
+            )
+            guard_match = main_guard_pattern.search(code)
+            if guard_match:
+                code = code[: guard_match.start()].rstrip()
+            return code
         else:
             raise NoCodeException
 
@@ -226,6 +264,10 @@ class OpenAI_LLM(LLM):
             model (str, optional): model abbreviation. Defaults to "gpt-4-turbo".
                 Options are: gpt-3.5-turbo, gpt-4-turbo, gpt-4o, and others from OpeNAI models library.
         """
+        if openai is None:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "openai is required to use OpenAI_LLM. Install the 'openai' package."
+            )
         super().__init__(api_key, model, None, **kwargs)
         self._client_kwargs = dict(api_key=api_key)
         self.client = openai.OpenAI(**self._client_kwargs)
@@ -319,13 +361,40 @@ class Gemini_LLM(LLM):
             model (str, optional): model abbreviation. Defaults to "gemini-2.0-flash".
                 Options are: "gemini-1.5-flash","gemini-2.0-flash", and others from Googles models library.
         """
+        if genai is None:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "google-generativeai is required to use Gemini_LLM. Install the 'google-generativeai' package."
+            )
         super().__init__(api_key, model, None, **kwargs)
         genai.configure(api_key=api_key)
         generation_config = {
             "temperature": 1,
             "top_p": 0.95,
             "top_k": 64,
-            "max_output_tokens": 8192,
+            "max_output_tokens": 65536,
+            "response_mime_type": "text/plain",
+        }
+
+        self.client = genai.GenerativeModel(
+            model_name=self.model,  # "gemini-1.5-flash","gemini-2.0-flash",
+            generation_config=generation_config,
+            system_instruction="You are a computer scientist and excellent Python programmer.",
+        )
+
+    def __getstate__(self):
+        """Return the picklable part of the instance."""
+        state = self.__dict__.copy()
+        state.pop("client", None)  # the client itself is NOT picklable
+        return state  # everything else is fine
+
+    def __setstate__(self, state):
+        """Restore from a pickled state."""
+        self.__dict__.update(state)  # put back the simple stuff
+        generation_config = {
+            "temperature": 1,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_output_tokens": 65536,
             "response_mime_type": "text/plain",
         }
 
@@ -385,6 +454,10 @@ class Ollama_LLM(LLM):
             model (str, optional): model abbreviation. Defaults to "llama3.2".
                 See for options: https://ollama.com/search.
         """
+        if ollama is None:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "ollama is required to use Ollama_LLM. Install the 'ollama' package."
+            )
         super().__init__("", model, None, **kwargs)
 
     def query(self, session_messages, max_retries: int = 5, default_delay: int = 10):
@@ -425,6 +498,53 @@ class Ollama_LLM(LLM):
                 time.sleep(default_delay * attempt)
 
 
+class Multi_LLM(LLM):
+    def __init__(self, llms: list[LLM]):
+        """
+        Combine multiple LLM instances and randomly choose one per call.
+
+        Args:
+            llms (list[LLM]): A list of LLM instances to combine.
+        """
+        if not llms:
+            raise ValueError("llms must contain at least one LLM instance")
+        model = "multi-llm"
+        super().__init__("", model)
+        self.llms = llms
+
+    def _pick_llm(self) -> LLM:
+        """
+        Randomly selects one of the LLMs from the list.
+        This method is used to alternate between LLMs during evolution.
+        """
+        return random.choice(self.llms)
+
+    def set_logger(self, logger):
+        self.logger = logger
+        self.log = True
+        for llm in self.llms:
+            llm.set_logger(logger)
+
+    def query(self, session_messages: list):
+        llm = self._pick_llm()
+        return llm.query(session_messages)
+
+    def sample_solution(self, *args, **kwargs):
+        llm = self._pick_llm()
+        return llm.sample_solution(*args, **kwargs)
+
+
+class DeepSeek_LLM(OpenAI_LLM):
+    """A manager class for the DeepSeek chat models."""
+
+    def __init__(self, api_key, model="deepseek-chat", temperature=0.8, **kwargs):
+        """Initializes DeepSeek LLM with required base URL."""
+        super().__init__(api_key, model=model, temperature=temperature, **kwargs)
+        self.base_url = "https://api.deepseek.com"
+        self._client_kwargs["base_url"] = self.base_url
+        self.client = openai.OpenAI(**self._client_kwargs)
+
+
 class Dummy_LLM(LLM):
     def __init__(self, model="DUMMY", **kwargs):
         """
@@ -453,7 +573,7 @@ class Dummy_LLM(LLM):
         for msg in session_messages:
             big_message += msg["content"] + "\n"
         response = """This is a dummy response from the DUMMY LLM. It does not connect to any LLM provider.
-It is used for testing purposes only. 
+It is used for testing purposes only.
 # Description: A simple random search algorithm that samples points uniformly in the search space and returns the best found solution.
 # Code:
 ```python
@@ -463,18 +583,18 @@ class RandomSearch:
     def __init__(self, budget=10000, dim=10):
         self.budget = budget
         self.dim = dim
-        self.f_opt = np.Inf
+        self.f_opt = np.inf
         self.x_opt = None
 
     def __call__(self, func):
         for i in range(self.budget):
             x = np.random.uniform(func.bounds.lb, func.bounds.ub)
-            
+
             f = func(x)
             if f < self.f_opt:
                 self.f_opt = f
                 self.x_opt = x
-            
+
         return self.f_opt, self.x_opt
 ```
 # Configuration Space:
