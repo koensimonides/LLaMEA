@@ -62,7 +62,7 @@ class LLaMEA:
         experiment_name="",
         elitism=True,
         HPO=False,
-        mutation_prompts=None,
+        operators: list[str] | list[tuple[str, int, float | Callable[[Solution], float]]]= None,
         adaptive_mutation=False,
         adaptive_prompt=False,
         budget=100,
@@ -103,9 +103,13 @@ class LLaMEA:
             elitism (bool): Flag to decide if elitism should be used in the evolutionary process.
             HPO (bool): Flag to decide if hyper-parameter optimization is part of the evaluation function.
                 In case it is, a configuration space should be asked from the LLM as additional output in json format.
-            mutation_prompts (list): A list of prompts to specify mutation operators to the LLM model. Each mutation, a random choice from this list is made.
+            operators (list): Either a list of mutation prompt strings to select from at random,
+                or a list of tuples (prompt, parent_count, weight), where 'prompt' is the prompt task message string,
+                'parent_count' is the number of parents required for this operator,
+                and 'weight' is the relative probability of selecting this operator.
+                'weight' can also be a callable that takes a Solution as input and returns a probability.
             adaptive_mutation (bool): If set to True, the mutation prompt 'Change X% of the lines of code' will be used in an adaptive control setting.
-                This overwrites mutation_prompts.
+                This overwrites operator_prompts.
             adaptive_prompt (bool): If True, the task prompt is optimized before each mutation, allowing it to co-evolve with the individuals.
             budget (int): The number of generations to run the evolutionary algorithm.
             eval_timeout (int): The number of seconds one evaluation can maximum take (to counter infinite loops etc.). Defaults to 1 hour.
@@ -253,10 +257,10 @@ for i in range(m):
 >>>>>>> REPLACE
 ```
 """
-        self.mutation_prompts = mutation_prompts
+        self.operators = operators
         self.adaptive_mutation = adaptive_mutation
-        if mutation_prompts == None:
-            self.mutation_prompts = [
+        if operators == None:
+            self.operators = [
                 "Refine the strategy of the selected solution to improve it.",  # small mutation
                 # "Generate a new algorithm that is different from the algorithms you have tried before.", #new random solution
             ]
@@ -468,30 +472,22 @@ Provide an improved / rephrased / augmented task prompt only. The intent of the 
             self.logevent(f"Prompt optimization failed: {e}")
             return individual.task_prompt
 
-    def construct_prompt(self, individual: Solution):
+    def construct_prompt(self, parents: list[Solution], operator: str):
         """
-        Constructs a new session prompt for the language model based on a selected individual.
+        Constructs a new session prompt for the language model based on the selected parents.
 
         Args:
-            individual (dict): The individual to mutate.
+            parents (list[Solution]): The individuals to mutate.
 
         Returns:
             list: A list of dictionaries simulating a conversation with the language model for the next evolutionary step.
         """
         # Generate the current population summary
         population_summary = "\n".join([ind.get_summary() for ind in self.population])
-        solution = individual.code
-        description = individual.description
-        feedback = individual.feedback
-        error_message = ""
-        if individual.error:
-            error_message = f"""
-### Error Encountered
-{individual.error}
 
-"""
+        
         if self.adaptive_mutation == True:
-            num_lines = len(solution.split("\n"))
+            num_lines = len(parents[0].split("\n"))
             prob = discrete_power_law_distribution(num_lines, 1.5)
             new_mutation_prompt = f"""Refine the strategy of the selected solution to improve it.
 Make sure you only change {(prob*100):.1f}% of the code, which means if the code has 100 lines, you can only change {prob*100} lines, and the rest of the lines should remain unchanged.
@@ -499,34 +495,28 @@ This input code has {num_lines} lines, so you can only change {max(1, int(prob*n
 This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot change more or less than this rate.
 """
             self.mutation_prompts = [new_mutation_prompt]
+            parents = [parents[0]]  # only single parent in adaptive mutation
 
-        mutation_operator = random.choice(self.mutation_prompts)
-        individual.set_operator(mutation_operator)
+        parent_infos = ""
+
+        for parent in parents:
+            parent_infos += f"""
+{self._make_parent_prompt_section(parent)}
+"""
+            
+
+        parents[0].set_operator(operator)
 
         task_prompt = (
-            individual.task_prompt if self.adaptive_prompt else self.task_prompt
+            parents[0].task_prompt if self.adaptive_prompt else self.task_prompt
         )
         final_prompt = f"""{task_prompt}
 The current population of algorithms already evaluated (name, description, score) is:
 {population_summary}
 
-The selected solution to update is:
-{description}
-
-With code:
-
-```python
-{solution}
-```
-
-
-Feedback:
-
-{feedback}
-
-{error_message}
-
-{mutation_operator}
+{"The selected solutions to apply crossover are:" if len(parents) > 1 else "The selected solution to update is:"}
+{parent_infos}
+{operator}
 
 {self.diff_output_format_prompt if self.diff_mode else self.output_format_prompt}
 """
@@ -541,7 +531,72 @@ Feedback:
             ]
         # Logic to construct the new prompt based on current evolutionary state.
         return session_messages
+    
+    def _make_parent_prompt_section(self, parent: Solution) -> str:
+        error_message = ""
+        if parent.error:
+            error_message = f"""
+### Error Encountered
+{parent.error}
 
+"""
+            
+        return f"""{parent.description}
+
+With code:
+
+```python
+{parent.code}
+```
+
+
+Feedback:
+
+{parent.feedback}
+{error_message}
+"""
+
+    def _pick_operator(self, individual: Solution) -> tuple[str, int]:
+        """
+        Select an operator based on weights.
+
+        Returns:
+            (prompt_task_message, number_of_parents)
+        """
+
+        # list[str]
+        if isinstance(self.operators[0], str):
+            return (random.choice(self.operators), 1)
+
+        # list[tuple[str, int, float|callable]]
+        prompts: list[str] = []
+        parent_counts: list[int] = []
+        weights: list[float] = []
+
+        for op in self.operators:
+            prompt, parent_count, weight_option = op
+            prompts.append(prompt)
+            parent_counts.append(int(parent_count))
+
+            # weight either given directly or as a callable function of the individual
+            try:
+                weight = float(weight_option(individual)) if callable(weight_option) else float(weight_option)
+            except Exception:
+                weight = 0.0
+            weights.append(weight)
+
+        # if all weights <= 0 we random pick from all
+        if not any(w > 0 for w in weights):
+            i = random.randrange(len(prompts))
+            return (prompts[i], parent_counts[i])
+
+        # pick only from positive weights
+        pos_idx = [i for i, w in enumerate(weights) if w > 0]
+        pos_weights = [weights[i] for i in pos_idx]
+
+        chosen = random.choices(pos_idx, weights=pos_weights, k=1)[0]
+        return (prompts[chosen], parent_counts[chosen])
+    
     def update_best(self):
         """
         Update the best individual in the new population
@@ -827,22 +882,32 @@ Feedback:
         Evolves a single solution by constructing a new prompt,
         querying the LLM, and evaluating the fitness.
         """
-        individual_copy = individual.copy()
-        if self.adaptive_prompt:
-            individual_copy.task_prompt = self.optimize_task_prompt(individual_copy)
-        new_prompt = self.construct_prompt(individual_copy)
+        parents = [individual.copy()]
+        parent_ids = [parents[0].id]
+        operator, parent_count = self._pick_operator(parents[0])
+        while len(parents) < parent_count:
+            cand = random.choice(self.population)
+            if cand.id in parent_ids:
+                continue
+            parents.append(cand.copy())
+            parent_ids.append(cand.id)
 
-        evolved_individual = individual.empty_copy()
+        if self.adaptive_prompt:
+            parents[0].task_prompt = self.optimize_task_prompt(parents[0])
+        new_prompt = self.construct_prompt(parents, operator)
+
+        evolved_individual = parents[0].empty_copy()
+        evolved_individual.parent_ids = parent_ids
         try:
             evolved_individual = self.llm.sample_solution(
                 new_prompt,
                 evolved_individual.parent_ids,
                 HPO=self.HPO,
-                base_code=individual.code,
+                base_code=parents[0].code,
                 diff_mode=self.diff_mode,
             )
             evolved_individual.generation = self.generation
-            evolved_individual.task_prompt = individual_copy.task_prompt
+            evolved_individual.task_prompt = parents[0].task_prompt
             if not self.evaluate_population:
                 evolved_individual = self.evaluate_fitness(evolved_individual)
         except Exception as e:
