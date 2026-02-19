@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import pickle
 import jsonlines
 
+from llamea.operator import Operator
 import numpy as np
 from joblib import Parallel, delayed
 
@@ -62,7 +63,7 @@ class LLaMEA:
         experiment_name="",
         elitism=True,
         HPO=False,
-        operators: list[str] | list[tuple[str, int, float | Callable[[Solution], float]]]= None,
+        operators: list[Operator]=None,
         adaptive_mutation=False,
         adaptive_prompt=False,
         budget=100,
@@ -103,11 +104,7 @@ class LLaMEA:
             elitism (bool): Flag to decide if elitism should be used in the evolutionary process.
             HPO (bool): Flag to decide if hyper-parameter optimization is part of the evaluation function.
                 In case it is, a configuration space should be asked from the LLM as additional output in json format.
-            operators (list): Either a list of mutation prompt strings to select from at random,
-                or a list of tuples (prompt, parent_count, weight), where 'prompt' is the prompt task message string,
-                'parent_count' is the number of parents required for this operator,
-                and 'weight' is the relative probability of selecting this operator.
-                'weight' can also be a callable that takes a Solution as input and returns a probability.
+            operators (list): List of operator objects.
             adaptive_mutation (bool): If set to True, the mutation prompt 'Change X% of the lines of code' will be used in an adaptive control setting.
                 This overwrites operator_prompts.
             adaptive_prompt (bool): If True, the task prompt is optimized before each mutation, allowing it to co-evolve with the individuals.
@@ -260,10 +257,7 @@ for i in range(m):
         self.operators = operators
         self.adaptive_mutation = adaptive_mutation
         if operators == None:
-            self.operators = [
-                "Refine the strategy of the selected solution to improve it.",  # small mutation
-                # "Generate a new algorithm that is different from the algorithms you have tried before.", #new random solution
-            ]
+            self.operators = [Operator(id="default", task_message="Refine the strategy of the selected solution to improve it.")]
         self.budget = budget
         self.n_parents = n_parents
         self.n_offspring = n_offspring
@@ -472,7 +466,7 @@ Provide an improved / rephrased / augmented task prompt only. The intent of the 
             self.logevent(f"Prompt optimization failed: {e}")
             return individual.task_prompt
 
-    def construct_prompt(self, parents: list[Solution], operator: str):
+    def construct_prompt(self, parents: list[Solution], operator: Operator):
         """
         Constructs a new session prompt for the language model based on the selected parents.
 
@@ -505,7 +499,7 @@ This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot chan
 """
             
 
-        parents[0].set_operator(operator)
+        parents[0].set_operator(operator.id)
 
         task_prompt = (
             parents[0].task_prompt if self.adaptive_prompt else self.task_prompt
@@ -516,7 +510,7 @@ The current population of algorithms already evaluated (name, description, score
 
 {"The selected solutions to apply crossover are:" if len(parents) > 1 else "The selected solution to update is:"}
 {parent_infos}
-{operator}
+{operator.task_message}
 
 {self.diff_output_format_prompt if self.diff_mode else self.output_format_prompt}
 """
@@ -556,46 +550,41 @@ Feedback:
 {error_message}
 """
 
-    def _pick_operator(self, individual: Solution) -> tuple[str, int]:
+    def _pick_operator(self, individual: Solution) -> Operator:
         """
         Select an operator based on weights.
 
         Returns:
-            (prompt_task_message, number_of_parents)
+            Operator: The selected operator to apply.
         """
 
-        # list[str]
-        if isinstance(self.operators[0], str):
-            return (random.choice(self.operators), 1)
-
-        # list[tuple[str, int, float|callable]]
-        prompts: list[str] = []
-        parent_counts: list[int] = []
+        operators: list[Operator] = []
         weights: list[float] = []
 
         for op in self.operators:
-            prompt, parent_count, weight_option = op
-            prompts.append(prompt)
-            parent_counts.append(int(parent_count))
+            operators.append(op)
 
-            # weight either given directly or as a callable function of the individual
             try:
-                weight = float(weight_option(individual)) if callable(weight_option) else float(weight_option)
+                weight = op.get_weight(individual)
             except Exception:
                 weight = 0.0
+
+            if weight == float("inf"):
+                weight = 1e10  # treat inf as a very large weight
+
             weights.append(weight)
 
         # if all weights <= 0 we random pick from all
         if not any(w > 0 for w in weights):
-            i = random.randrange(len(prompts))
-            return (prompts[i], parent_counts[i])
+            i = random.randrange(len(operators))
+            return operators[i]
 
         # pick only from positive weights
         pos_idx = [i for i, w in enumerate(weights) if w > 0]
         pos_weights = [weights[i] for i in pos_idx]
 
         chosen = random.choices(pos_idx, weights=pos_weights, k=1)[0]
-        return (prompts[chosen], parent_counts[chosen])
+        return operators[chosen]
     
     def update_best(self):
         """
@@ -884,8 +873,8 @@ Feedback:
         """
         parents = [individual.copy()]
         parent_ids = [parents[0].id]
-        operator, parent_count = self._pick_operator(parents[0])
-        while len(parents) < parent_count:
+        operator = self._pick_operator(parents[0])
+        while len(parents) < operator.parent_count: # Select additional parents at random if needed for crossover
             cand = random.choice(self.population)
             if cand.id in parent_ids:
                 continue
@@ -920,8 +909,28 @@ Feedback:
             self.logevent(f"An exception occured: {traceback.format_exc()}.")
 
         # self.progress_bar.update(1)
-        return evolved_individual
 
+        fitness_delta = self._determine_fitness_delta(parents[0].fitness, evolved_individual)
+        operator.update_weight(fitness_delta)
+        return evolved_individual
+    
+    def _determine_fitness_delta(self, parent_fitness: float, new: Solution) -> float:
+        # Determine fitness delta
+        # both >= 0         -> new fitness - old fitness
+        # new >= 0, old bad -> new fitness 
+        # new bad, old > 0  -> -old fitness
+        # both bad          -> 0
+        # gives delta in range [-1, 1], assuming fitness is normalized to [0, 1]
+        fitness_delta = 0.0
+        if new.fitness >= 0 and parent_fitness >= 0:
+            fitness_delta = new.fitness - parent_fitness
+        elif new.fitness >= 0:
+            fitness_delta = new.fitness
+        elif parent_fitness > 0:
+            fitness_delta = -parent_fitness
+
+        return fitness_delta
+    
     def get_population_from(self, archive_path):
         """
         Finds population log in archive_path/log.jsonl and loads it to current population.
