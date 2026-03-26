@@ -508,7 +508,7 @@ This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot chan
 The current population of algorithms already evaluated (name, description, score) is:
 {population_summary}
 
-{"The selected solutions to apply crossover are:" if len(parents) > 1 else "The selected solution to update is:"}
+{"The selected algorithms are:" if len(parents) > 1 else "The selected solution to update is:"}
 {parent_infos}
 {operator.task_message}
 
