@@ -497,9 +497,6 @@ This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot chan
             parent_infos += f"""
 {self._make_parent_prompt_section(parent)}
 """
-            
-
-        parents[0].set_operator(operator.id)
 
         task_prompt = (
             parents[0].task_prompt if self.adaptive_prompt else self.task_prompt
@@ -887,6 +884,7 @@ Feedback:
 
         evolved_individual = parents[0].empty_copy()
         evolved_individual.parent_ids = parent_ids
+        evolved_individual.set_operator(operator.id)
         try:
             evolved_individual = self.llm.sample_solution(
                 new_prompt,
