@@ -563,7 +563,8 @@ Feedback:
 
             try:
                 weight = op.get_weight(individual)
-            except Exception:
+            except Exception as e:
+                print(f"Error computing weight for operator {op.id}: {e}")
                 weight = 0.0
 
             if weight == float("inf"):
@@ -883,8 +884,6 @@ Feedback:
         new_prompt = self.construct_prompt(parents, operator)
 
         evolved_individual = parents[0].empty_copy()
-        evolved_individual.parent_ids = parent_ids
-        evolved_individual.set_operator(operator.id)
         try:
             evolved_individual = self.llm.sample_solution(
                 new_prompt,
@@ -909,6 +908,8 @@ Feedback:
         # self.progress_bar.update(1)
 
         fitness_delta = self._determine_fitness_delta(parents[0].fitness, evolved_individual)
+        evolved_individual.parent_ids = parent_ids
+        evolved_individual.set_operator(operator.id)
         operator.update_weight(fitness_delta)
         return evolved_individual
     

@@ -13,7 +13,7 @@ class Operator:
         id,
         task_message,
         parent_count=1,
-        weight_source: float |  Callable[[str, Solution], float] = 1.0,
+        weight_source: float | Callable[[str, Solution], float] = 1.0,
         update_callback: Callable[[str, float], None] | None = None,
     ):
         """
