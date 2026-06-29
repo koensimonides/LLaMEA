@@ -870,7 +870,7 @@ Feedback:
         querying the LLM, and evaluating the fitness.
         """
         parents = [individual.copy()]
-        parent_ids = [parents[0].id]
+        parent_ids = [individual.id]
         operator = self._pick_operator(individual)
         while len(parents) < operator.parent_count: # Select additional parents at random if needed for crossover
             cand = random.choice(self.population)
@@ -880,20 +880,20 @@ Feedback:
             parent_ids.append(cand.id)
 
         if self.adaptive_prompt:
-            parents[0].task_prompt = self.optimize_task_prompt(parents[0])
+            individual.task_prompt = self.optimize_task_prompt(individual)
         new_prompt = self.construct_prompt(parents, operator)
 
-        evolved_individual = parents[0].empty_copy()
+        evolved_individual = individual.empty_copy()
         try:
             evolved_individual = self.llm.sample_solution(
                 new_prompt,
                 evolved_individual.parent_ids,
                 HPO=self.HPO,
-                base_code=parents[0].code,
+                base_code=individual.code,
                 diff_mode=self.diff_mode,
             )
             evolved_individual.generation = self.generation
-            evolved_individual.task_prompt = parents[0].task_prompt
+            evolved_individual.task_prompt = individual.task_prompt
             if not self.evaluate_population:
                 evolved_individual = self.evaluate_fitness(evolved_individual)
         except Exception as e:
