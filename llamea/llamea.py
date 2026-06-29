@@ -870,8 +870,8 @@ Feedback:
         querying the LLM, and evaluating the fitness.
         """
         parents = [individual.copy()]
-        parent_ids = [individual.id]
-        operator = self._pick_operator(parents[0])
+        parent_ids = [parents[0].id]
+        operator = self._pick_operator(individual)
         while len(parents) < operator.parent_count: # Select additional parents at random if needed for crossover
             cand = random.choice(self.population)
             if cand.id in parent_ids:

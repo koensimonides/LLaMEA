@@ -1,5 +1,8 @@
 {
     "python.analysis.extraPaths": [
         "./benchmarks/tuto_global_optimization_photonics"
-    ]
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": []
 }
